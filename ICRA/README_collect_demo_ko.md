@@ -77,6 +77,47 @@ python collect_demo.py --renderer mujoco --camera agentview
 > 키 입력은 전역 `pynput` 훅으로 잡히므로 렌더 창에 포커스가 없어도 동작합니다.
 > `mjviewer` 창에서는 마우스로 카메라를 움직이세요.
 
+## 🔗 Module-1 파이프라인과 연결 (`--pipeline`)
+
+이 수집기의 출력(hdf5 구조·`env_info`·`demo_<N>` 폴더)은 이미 파이프라인 리더
+(`replay/hdf5_utils.py`)와 **포맷 호환**입니다. 남은 건 **환경/컨트롤러/저장 경로**를
+파이프라인 설정에 맞추는 것뿐이라, 이를 한 번에 해주는 `--pipeline` 프리셋을 넣었습니다.
+
+```bash
+# 프로젝트 루트(ICRA/)에서
+python collect_demo.py --pipeline --num-demos 20
+```
+
+`--pipeline` 이 하는 일:
+
+| 항목 | 고정 값 | 이유 |
+|------|---------|------|
+| 환경 | `PickPlaceCan` | `build_feature_bank` 가 `object_type=can` 을 가정 |
+| 로봇 | `Panda` | config `m1_goal_phase_pickplace_can.yaml` 기준 |
+| 컨트롤러 | `OSC_POSITION` (4-dim) | 파이프라인이 `(T,4)` 액션·`assert_action_dim_4` 를 요구 (팔 롤링 X) |
+| 저장 경로 | `./demos/pickplace_can/demo_<N>/demo.hdf5` | config `demo_root: ./demos/pickplace_can` 와 정확히 일치 |
+
+그래서 수집 직후 바로 다음 단계가 그대로 읽습니다:
+
+```bash
+python feature_bank/build_feature_bank.py --config configs/m1_goal_phase_pickplace_can.yaml
+```
+
+연결 체인:
+
+```
+collect_demo.py --pipeline
+   └─> demos/pickplace_can/demo_<N>/demo.hdf5   (data/demo_1/{states,actions(T,4)}, env_info)
+          └─> find_demo_files(demo_root) → load_env_info → read_demo   (replay/hdf5_utils.py)
+                 └─> DemoReplayer.replay → compute_features → data/processed/*.npz
+                        └─> phase_segmenter/train.py → m1_pipeline.py → (g, z_t)
+```
+
+> ⚠️ 팔 롤링(자유 회전)이나 다른 환경/로봇으로 수집한 `OSC_POSE`(7-dim) 데모는
+> 이 4-dim 파이프라인과 호환되지 않습니다(일반 데모/시연용). 파이프라인용은 반드시
+> `--pipeline`(또는 `--controller OSC_POSITION --environment PickPlaceCan --robots Panda`)
+> 로 수집하세요.
+
 ## 주요 CLI 옵션
 
 | 옵션 | 기본값 | 설명 |
@@ -84,6 +125,7 @@ python collect_demo.py --renderer mujoco --camera agentview
 | `--environment` | (메뉴) | 환경 이름. 생략 시 터미널 메뉴 |
 | `--robots` | (메뉴) | 로봇 이름(복수 가능). 생략 시 터미널 메뉴 |
 | `--num-demos` | (질문) | 수집할 데모 개수. 생략 시 터미널에서 물어봄. 이 개수만큼 저장되면 종료 |
+| `--pipeline` | off | Module-1 파이프라인 프리셋(PickPlaceCan+Panda+OSC_POSITION → `demos/pickplace_can`) |
 | `--env-configuration` | (메뉴) | TwoArm 환경의 팔 구성(예: `bimanual`) |
 | `--controller` | `OSC_POSE` | `OSC_POSE`(롤링 O, 7-dim) / `OSC_POSITION`(롤링 X, 4-dim) |
 | `--renderer` | `mjviewer` | `mjviewer`(카메라 이동 O) / `mujoco`(OpenCV, 고정 카메라) |
