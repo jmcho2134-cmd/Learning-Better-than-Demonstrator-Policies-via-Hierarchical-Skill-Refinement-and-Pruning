@@ -522,12 +522,6 @@ def main():
     parser.add_argument("--num-demos", type=int, default=None,
                         help="How many demos to collect (saved with 'y'). Omit to be asked in the "
                              "terminal. Collection stops once this many demos are saved.")
-    parser.add_argument("--pipeline", action="store_true",
-                        help="Preset for this project's Module-1 pipeline: forces PickPlaceCan + "
-                             "Panda + OSC_POSITION (4-dim) and writes demos to "
-                             "<directory>/pickplace_can/demo_<N>/demo.hdf5, exactly where "
-                             "configs/m1_goal_phase_pickplace_can.yaml's demo_root points, so "
-                             "feature_bank/build_feature_bank.py reads them directly.")
     parser.add_argument("--env-configuration", type=str, default=None,
                         help="Two-arm configuration (e.g. 'bimanual'). Omit to pick from a menu "
                              "for TwoArm envs.")
@@ -562,16 +556,6 @@ def main():
             "Extend it with robosuite's SpaceMouse device if needed."
         )
 
-    # --- pipeline preset: pin env/robot/controller so the demos are readable by
-    #     feature_bank/build_feature_bank.py (PickPlaceCan, Panda, 4-dim OSC_POSITION) ---
-    if args.pipeline:
-        args.environment = "PickPlaceCan"
-        args.robots = ["Panda"]
-        args.controller = "OSC_POSITION"
-        print("[pipeline] PickPlaceCan + Panda + OSC_POSITION (4-dim) 로 고정합니다.")
-        print("[pipeline] 저장 위치: <directory>/pickplace_can/demo_<N>/demo.hdf5 "
-              "(config demo_root 와 일치).\n")
-
     # --- interactive (or CLI) environment/robot selection ---
     options = choose_options_interactively(args)
 
@@ -598,26 +582,33 @@ def main():
         )
 
     # --- output root: ./demos/<Env>_<Robot>/  (each accepted demo -> demo_<N>/) ---
-    # e.g. demos/Lift_Panda/demo_1/demo.hdf5, demos/Lift_Panda/demo_2/demo.hdf5, ...
-    # In --pipeline mode we instead use ./demos/pickplace_can so the output path
-    # matches configs/m1_goal_phase_pickplace_can.yaml's demo_root exactly.
-    if args.pipeline:
-        run_name = "pickplace_can"
-    else:
-        robots_tag = "-".join(options["robots"]) if isinstance(options["robots"], (list, tuple)) else options["robots"]
-        run_name = "{}_{}".format(options["env_name"], robots_tag)
+    # e.g. demos/PickPlaceCan_Panda/demo_1/demo.hdf5, demos/PickPlaceMilk_Panda/demo_1/...
+    # The Module-1 pipeline's demo_root is ./demos and it discovers these
+    # recursively, so demos collected here feed build_feature_bank.py directly.
+    robots_tag = "-".join(options["robots"]) if isinstance(options["robots"], (list, tuple)) else options["robots"]
+    run_name = "{}_{}".format(options["env_name"], robots_tag)
     root_dir = os.path.join(args.directory, run_name)
     os.makedirs(root_dir, exist_ok=True)
 
-    # --- env metadata for the hdf5 (so downstream code can verify the action space) ---
-    env_info = json.dumps({
-        "env_name": options["env_name"],
+    # --- env metadata for the hdf5 (so downstream code follows THIS demo) ---
+    # We also record object_type for PickPlace-family envs (PickPlaceCan -> "can",
+    # PickPlaceMilk -> "milk", ...) so build_feature_bank.py picks the right object
+    # per demo without any hard-coded "can". Non-PickPlace envs leave it null.
+    env_name = options["env_name"]
+    object_type = None
+    if env_name.startswith("PickPlace") and len(env_name) > len("PickPlace"):
+        object_type = env_name[len("PickPlace"):].lower()   # PickPlaceMilk -> "milk"
+    env_info_dict = {
+        "env_name": env_name,
         "robots": options["robots"] if isinstance(options["robots"], (list, tuple)) else [options["robots"]],
         "controller_configs": controller_config,
         "action_dim": action_dim,
         "arm_controller": arm_controller_name,
         "control_freq": args.control_freq,
-    })
+    }
+    if object_type is not None:
+        env_info_dict["object_type"] = object_type
+    env_info = json.dumps(env_info_dict)
 
     # --- wrap: Visualization -> DataCollection (as in the stock collector) ---
     env = VisualizationWrapper(env)

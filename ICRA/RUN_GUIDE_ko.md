@@ -2,15 +2,15 @@
 
 이 문서는 지금까지 만든 코드로 **데모를 수집하고 Module 1(`g`, `z_t`)까지 뽑아내는 전체 실행 방법**을 한국어로 정리한 것입니다. 모든 명령은 **프로젝트 루트**(`/home/jaemin/Desktop/ICRA_뇨롱이`)에서, **conda `robosuite` 환경**을 켠 상태로 실행합니다.
 
-> ⚠️ 지금 디스크 상태는 "처음부터" 입니다 — `demos/pickplace_can`, `data/processed`, `checkpoints/phase_segmenter` 모두 비어 있어(`.gitkeep`만) **1단계 데모 수집이 반드시 먼저** 필요합니다.
+> ⚠️ 지금 디스크 상태는 "처음부터" 입니다 — `demos/`, `data/processed`, `checkpoints/phase_segmenter` 모두 비어 있어(`.gitkeep`만) **1단계 데모 수집이 반드시 먼저** 필요합니다.
 
 ---
 
 ## 0. 전체 흐름 한눈에
 
 ```
-[1] 데모 수집        collect_pickplace_can.py --random-can   (GUI+키보드, 1회=성공데모 1개 → 20~30회 반복)
-        │            → demos/pickplace_can/demo_1/demo.hdf5, demo_2/…
+[1] 데모 수집        collect_demo.py   (GUI+키보드, 환경/로봇/개수 선택, y/n 저장)
+        │            → demos/<Env>_<Robot>/demo_1/demo.hdf5, demo_2/…
         ▼
 [2] 피처뱅크 빌드    feature_bank/build_feature_bank.py       (robosuite 재생, headless)
         │            → data/processed/<run>__<demo>.npz  (features, actions, g …)
@@ -57,25 +57,27 @@ pip install torch pyyaml matplotlib scikit-learn
 
 ## 2. 단계별 실행
 
-### [1] 데모 수집 — `collect_pickplace_can.py` 또는 `collect_demo.py --pipeline`
+### [1] 데모 수집 — `collect_demo.py` (권장, 단일 수집기)
 
-**Module 1은 캔 위치가 다양해야** 일반화가 됩니다. 그래서 반드시 `--random-can`으로 수집하세요.
+이제 **`collect_demo.py` 하나로만** 수집하면 나머지 파이프라인이 각 데모의 `env_info`를
+읽어 **자동으로 따라옵니다**(환경·객체·액션 차원). 별도 옵션(`--pipeline`) 필요 없습니다.
 
 ```bash
-python collect_pickplace_can.py --random-can
-# 마커까지 숨기고 싶으면:
-python collect_pickplace_can.py --random-can --hide-other-targets
+python collect_demo.py
+# 실행하면 터미널에서 환경(PickPlaceCan/Milk/Bread/Cereal) → 로봇 → 수집 개수를 물어봅니다.
+# 또는 인자로 바로:
+python collect_demo.py --environment PickPlaceCan --robots Panda --num-demos 20
 ```
 
-> 🔗 **연결된 대안 (권장): `collect_demo.py --pipeline`**
-> 일반화 수집기 `collect_demo.py` 를 `--pipeline` 로 실행하면 이 파이프라인과
-> **바로 연결**됩니다. PickPlaceCan + Panda + OSC_POSITION(4-dim)으로 고정되고,
-> 출력이 정확히 `./demos/pickplace_can/demo_<N>/demo.hdf5` (= config `demo_root`)로
-> 저장되어 아래 [2] 빌드가 그대로 읽습니다. 수집 개수도 물어봐서 그만큼만 모읍니다.
-> ```bash
-> python collect_demo.py --pipeline --num-demos 20
-> ```
-> (자세한 사용법: `README_collect_demo_ko.md`. 캔 위치는 기본으로 매번 랜덤입니다.)
+- **여러 객체 혼합 가능**: `PickPlaceCan`, `PickPlaceMilk`, `PickPlaceBread`, `PickPlaceCereal`
+  을 각각 수집하면 `demos/PickPlaceCan_Panda/`, `demos/PickPlaceMilk_Panda/` … 로 나뉘어
+  저장되고, [3] 빌드가 `./demos` 아래를 **재귀적으로 모두** 찾아 각 객체에 맞게 처리합니다.
+- **팔 롤링(OSC_POSE, 7-dim)도 OK**: 파이프라인이 위치 델타 3개 + 그리퍼만 피처로 쓰므로
+  4-dim(OSC_POSITION)이든 7-dim(OSC_POSE)이든 학습됩니다. (기본은 OSC_POSE = 롤링 O)
+- 저장 흐름: 에피소드 끝나면 `y`(저장)/`n`(리셋 재수집), 입력한 개수만큼 모이면 자동 종료.
+
+> (기존 `collect_pickplace_can.py --random-can` 도 그대로 동작하지만, 이제 표준 수집기는
+> `collect_demo.py` 입니다. 자세한 사용법: `README_collect_demo_ko.md`)
 
 > ❌ `./run_collect_can.sh` 나 옵션 없는 기본 실행은 **`--seed 0` 고정**이라 캔이 매번 같은 자리에 나옵니다(위치 다양성 0). Module 1 데모 수집에는 쓰지 마세요. (고정 위치가 필요한 다른 실험용입니다.)
 
@@ -122,7 +124,7 @@ python inspect_demo.py ./demos/pickplace_can/demo_1/demo.hdf5
 python feature_bank/build_feature_bank.py --config configs/m1_goal_phase_pickplace_can.yaml
 ```
 
-- 입력: `demos/pickplace_can/*/demo.hdf5`
+- 입력: `demos/**/demo.hdf5` (config `demo_root: ./demos` 아래 **재귀** 탐색 → 모든 환경/객체 자동 포함)
 - 출력: `data/processed/<run>__<demo>.npz` (features (T,15), actions, g, feature_names …)
 - robosuite로 env를 재구성해 상태를 재생하지만 **화면은 안 띄웁니다(headless)**.
 
@@ -169,7 +171,7 @@ python phase_segmenter/visualize.py --config configs/m1_goal_phase_pickplace_can
 
 | 무엇 | 경로 |
 |------|------|
-| 수집된 데모 | `demos/pickplace_can/demo_<N>/demo.hdf5` |
+| 수집된 데모 | `demos/<Env>_<Robot>/demo_<N>/demo.hdf5` |
 | 피처뱅크 | `data/processed/<run>__<demo>.npz` |
 | 학습 산출물 | `checkpoints/phase_segmenter/norm_stats.npz`, `best.pt` |
 | Module 2 입력 (g, z_t) | `data/processed/<run>__<demo>_m1.npz` |
@@ -218,12 +220,12 @@ conda activate robosuite
 cd /home/jaemin/Desktop/ICRA_뇨롱이
 pip install torch pyyaml matplotlib scikit-learn
 
-# ── 1) 데모 수집: 성공할 때까지 조작 → y 저장. 20~30개 될 때까지 반복 실행 ──
-python collect_pickplace_can.py --random-can
-#   (필요하면 --hide-other-targets 추가; 매 실행이 demo_1, demo_2, … 로 쌓임)
+# ── 1) 데모 수집: 환경/로봇/개수 선택 → 조작 → y 저장(개수만큼 자동 종료) ──
+python collect_demo.py --environment PickPlaceCan --robots Panda --num-demos 20
+#   (그냥 python collect_demo.py 로 실행하면 메뉴로 물어봄; demo_1, demo_2, … 로 쌓임)
 
 # ── (선택) 확인 ────────────────────────────────
-python inspect_demo.py ./demos/pickplace_can/demo_1/demo.hdf5
+python inspect_demo.py ./demos/PickPlaceCan_Panda/demo_1/demo.hdf5
 
 # ── 2~5) Module 1 파이프라인 ───────────────────
 python feature_bank/build_feature_bank.py --config configs/m1_goal_phase_pickplace_can.yaml
