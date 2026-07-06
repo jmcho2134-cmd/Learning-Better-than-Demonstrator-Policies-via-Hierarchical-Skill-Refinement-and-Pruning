@@ -1,0 +1,74 @@
+# =============================================================================
+# Module 1 config: Goal Inference + Learned Phase Segmenter (PickPlaceCan, Panda)
+# =============================================================================
+# Single source of truth for the whole M1 pipeline (feature bank -> weak labels
+# -> posterior training -> (g, z_t) export for Module 2).
+#
+# Everything here is read by the CLIs; NOTHING is executed at authoring time.
+# Paths are relative to the PROJECT ROOT (the folder holding this repo), because
+# every entry-point script inserts the project root on sys.path and resolves
+# paths from there.
+# =============================================================================
+
+# ---- I/O -------------------------------------------------------------------
+paths:
+  demo_root: ./demos/pickplace_can        # each run subdir holds a demo.hdf5
+  processed_out: ./data/processed         # per-demo feature/label/(g,z_t) .npz
+  reports_out: ./data/reports             # visualize.py PNG + CSV
+  checkpoint_dir: ./checkpoints/phase_segmenter   # norm_stats.npz + best.pt
+
+# ---- Task / object ---------------------------------------------------------
+task:
+  object_name: Can          # robosuite object name (obj_body_id key); lowercase
+                            # "can" is the object_to_id key. See name_lookup.py.
+  object_type: can          # key into env.object_to_id / target_bin_placements
+
+# ---- Phase label space -----------------------------------------------------
+# Order defines the integer id of each phase (0..K-1). "stabilize" is optional;
+# with use_stabilize=false, K=5 (approach,grasp,lift,transport,place).
+phases:
+  names: [approach, grasp, lift, transport, place]
+  use_stabilize: false      # if true, appends "stabilize" -> K=6
+
+# ---- Weak-label (bootstrap) thresholds -------------------------------------
+# Physical-event pseudo-labels computed from RELATIVE features. These are ONLY a
+# bootstrap signal; the deployed artifact is the trained network. All distances
+# are in meters. See phase_segmenter/weak_labels.py for the exact event rules.
+weak_labels:
+  grasp_dist: 0.03          # eef<->obj distance to count as a grasp contact
+  held_dist: 0.06           # eef<->obj distance to count the obj as "held"
+  gripper_closed: 0.0       # commanded gripper (action[3]) > this  => closing
+                            # (using the COMMANDED gripper is robust vs unknown
+                            #  finger-qpos ranges; see weak_labels.py note)
+  lift_height: 0.04         # obj height above table to count as "lifted"
+  target_xy: 0.05           # obj<->target XY distance below this => "at target"
+  smooth_width: 3           # odd window for single-frame spike median smoothing
+
+# ---- Posterior model q_omega(z_t | feature-history) ------------------------
+model:
+  input_window: 64          # k: training chunk length (timesteps per sample)
+  stride: 32                # sliding-window stride when chunking a demo
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.2
+  bidirectional: true       # training default; infer.py can force causal (uni)
+
+# ---- Training --------------------------------------------------------------
+training:
+  batch_size: 32
+  epochs: 40
+  lr: 0.001
+  weight_decay: 0.0
+  val_split_by_demo: 0.2    # fraction of DEMOS (not timesteps) held out for val
+  seed: 0
+  device: auto              # "auto" -> cuda if available else cpu; or "cpu"/"cuda"
+  num_workers: 0
+
+# ---- Loss weights ----------------------------------------------------------
+loss:
+  w_ce: 1.0                 # PRIMARY: cross-entropy vs weak labels
+  alpha_ds: 0.0             # OPTIONAL DI-flavored aux (next-action/next-delta MSE
+                            #  conditioned on z_t). Default 0 -> weak-label CE only.
+                            #  Raise (and lower w_ce) for a more H-AIRL-like,
+                            #  less-supervised posterior. Research ablation only.
+  w_smooth: 0.05            # temporal smoothness on adjacent-timestep predictions

@@ -57,7 +57,7 @@ pip install torch pyyaml matplotlib scikit-learn
 
 ## 2. 단계별 실행
 
-### [1] 데모 수집 — `collect_pickplace_can.py`
+### [1] 데모 수집 — `collect_pickplace_can.py` 또는 `collect_demo.py --pipeline`
 
 **Module 1은 캔 위치가 다양해야** 일반화가 됩니다. 그래서 반드시 `--random-can`으로 수집하세요.
 
@@ -66,6 +66,16 @@ python collect_pickplace_can.py --random-can
 # 마커까지 숨기고 싶으면:
 python collect_pickplace_can.py --random-can --hide-other-targets
 ```
+
+> 🔗 **연결된 대안 (권장): `collect_demo.py --pipeline`**
+> 일반화 수집기 `collect_demo.py` 를 `--pipeline` 로 실행하면 이 파이프라인과
+> **바로 연결**됩니다. PickPlaceCan + Panda + OSC_POSITION(4-dim)으로 고정되고,
+> 출력이 정확히 `./demos/pickplace_can/demo_<N>/demo.hdf5` (= config `demo_root`)로
+> 저장되어 아래 [2] 빌드가 그대로 읽습니다. 수집 개수도 물어봐서 그만큼만 모읍니다.
+> ```bash
+> python collect_demo.py --pipeline --num-demos 20
+> ```
+> (자세한 사용법: `README_collect_demo_ko.md`. 캔 위치는 기본으로 매번 랜덤입니다.)
 
 > ❌ `./run_collect_can.sh` 나 옵션 없는 기본 실행은 **`--seed 0` 고정**이라 캔이 매번 같은 자리에 나옵니다(위치 다양성 0). Module 1 데모 수집에는 쓰지 마세요. (고정 위치가 필요한 다른 실험용입니다.)
 
