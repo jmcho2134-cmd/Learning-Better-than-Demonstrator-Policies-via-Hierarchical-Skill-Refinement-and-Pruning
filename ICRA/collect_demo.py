@@ -18,8 +18,10 @@ robosuite's own reference scripts:
   ``choose_environment`` / ``choose_robots`` / ``choose_multi_arm_config`` from
   ``robosuite.utils.input_utils``.
 * ``robosuite/scripts/collect_human_demonstrations.py`` -> the actual teleop
-  collection loop (``collect_human_trajectory``) and the HDF5 writer
-  (``gather_demonstrations_as_hdf5``), reused verbatim.
+  collection loop (``collect_human_trajectory``), reused verbatim. Its HDF5
+  writer is intentionally NOT reused: we save with our own ``save_episode_as_hdf5``
+  so an accepted demo is written whether or not the env auto-flagged success
+  (the same layout robosuite's writer produces).
 
 Two things the user explicitly asked for
 -----------------------------------------
@@ -43,12 +45,14 @@ Usage (activate the conda ``robosuite`` env first)::
     python collect_demo.py --controller OSC_POSITION   # 4-dim, no roll (pipeline)
     python collect_demo.py --renderer mujoco --camera agentview
 
-Quit: press ``q`` in the keyboard listener to end the current episode (it is
-saved to the HDF5 only if the task succeeded); press ``Ctrl+C`` in the terminal
-to stop the whole program.
+Quit: press ``q`` in the keyboard listener to end the current episode. After
+each episode the terminal asks whether to save it (``y`` -> write demo_<N>,
+``n`` -> discard and reset to re-collect). Press ``Ctrl+C`` in the terminal to
+stop the whole program.
 """
 
 import argparse
+import datetime
 import inspect
 import json
 import os
@@ -56,6 +60,7 @@ import shutil
 import time
 from glob import glob
 
+import h5py
 import numpy as np
 
 import robosuite as suite
@@ -64,14 +69,17 @@ import robosuite as suite
 # load_controller_config. Import path verified in robosuite/controllers/__init__.py.
 from robosuite.controllers import load_composite_controller_config
 
-# Reuse robosuite's own collection loop + hdf5 gatherer rather than reimplement.
-# Importing the module does NOT run its __main__ block. Signatures differ across
-# 1.5.x patch releases (1.5.1 has no goal_update_mode; 1.5.2 adds it), so we call
-# collect_human_trajectory version-robustly below via inspect.signature.
-from robosuite.scripts.collect_human_demonstrations import (
-    collect_human_trajectory,
-    gather_demonstrations_as_hdf5,
-)
+# Reuse robosuite's own teleop collection loop (NOT its gatherer). Importing the
+# module does NOT run its __main__ block. collect_human_trajectory's signature
+# differs across 1.5.x patch releases (1.5.1 has no goal_update_mode; 1.5.2 adds
+# it), so we call it version-robustly below via inspect.signature.
+#
+# We deliberately do NOT use robosuite's gather_demonstrations_as_hdf5: it writes
+# an episode ONLY when env._check_success() latched during collection, so a demo
+# the human wants to keep but that the env never flagged successful would be
+# silently dropped. Instead we save the just-collected episode ourselves (see
+# save_episode_as_hdf5) whenever the user answers 'y', regardless of the flag.
+from robosuite.scripts.collect_human_demonstrations import collect_human_trajectory
 
 # Interactive terminal menus, exactly as robosuite's demo_random_action.py uses.
 from robosuite.utils.input_utils import (
@@ -300,7 +308,7 @@ def print_launch_banner(args, options, out_dir, action_dim, arm_controller_name)
         "  arrow keys  : move end-effector in x (up/down) and y (left/right)",
         "  . / ;       : move end-effector down / up (z)",
         "  spacebar    : toggle gripper open/close",
-        "  q           : end the current episode (성공 시 저장 여부를 y/n 로 물어봄)",
+        "  q           : end the current episode (종료 후 저장 여부를 y/n 로 물어봄)",
     ]
     if rolling:
         controls.append("  e/r y/h p/o : ROLL / PITCH / YAW the end-effector  (OSC_POSE 회전키 활성)")
@@ -332,8 +340,8 @@ def print_launch_banner(args, options, out_dir, action_dim, arm_controller_name)
     print("-" * 72)
     print(" 키보드 리스너는 전역 pynput 훅이라 렌더 창에 포커스가 없어도 키가 잡힙니다.")
     print(" 프로그램 전체를 멈추려면 이 터미널에서 Ctrl+C 를 누르세요.")
-    print(" 에피소드가 성공하면 터미널에서 저장 여부(y/n)를 물어봅니다.")
-    print("   y -> 저장 후 다음 데모 계속   /   n -> 리셋 후 재수집")
+    print(" 매 에피소드가 끝나면(q 또는 성공) 터미널에서 저장 여부(y/n)를 물어봅니다.")
+    print("   y -> 저장 후 다음 데모 계속   /   n -> 저장 안 하고 리셋 후 재수집")
     print(f" 저장 위치: {os.path.join(out_dir, 'demo_<N>', 'demo.hdf5')}  (승인한 데모마다 번호별 폴더)")
     print("=" * 72 + "\n")
 
@@ -377,6 +385,55 @@ def episode_successful(ep_dir):
         dic = np.load(state_file, allow_pickle=True)
         ok = ok or bool(dic["successful"])
     return ok
+
+
+def save_episode_as_hdf5(ep_dir, out_dir, env_info):
+    """Write a single collected episode (ep_dir) into out_dir/demo.hdf5.
+
+    This is a trimmed copy of robosuite's gather_demonstrations_as_hdf5 for ONE
+    episode, with the crucial difference that it does NOT gate on the success
+    flag: whatever the human accepted with 'y' is saved. The resulting file has
+    the same layout robosuite produces (a single 'demo_1' group with `states`
+    and `actions`, plus `data` attrs incl. env_info), so downstream tooling reads
+    it unchanged. Returns (num_states, was_flagged_successful).
+    """
+    state_paths = os.path.join(ep_dir, "state_*.npz")
+    states, actions = [], []
+    env_name = None
+    success = False
+    for state_file in sorted(glob(state_paths)):
+        dic = np.load(state_file, allow_pickle=True)
+        env_name = str(dic["env"])
+        states.extend(dic["states"])
+        for ai in dic["action_infos"]:
+            actions.append(ai["actions"])
+        success = success or bool(dic["successful"])
+
+    if len(states) == 0:
+        return 0, success
+
+    # Drop the trailing state: DataCollectionWrapper records the state AFTER the
+    # action, so there is one extra state at the end (same fix robosuite applies).
+    del states[-1]
+    assert len(states) == len(actions), (len(states), len(actions))
+
+    hdf5_path = os.path.join(out_dir, "demo.hdf5")
+    with h5py.File(hdf5_path, "w") as f:
+        grp = f.create_group("data")
+        ep_grp = grp.create_group("demo_1")  # one demo per demo_<N>/ folder
+        with open(os.path.join(ep_dir, "model.xml"), "r") as xml_f:
+            ep_grp.attrs["model_file"] = xml_f.read()
+        ep_grp.create_dataset("states", data=np.array(states))
+        ep_grp.create_dataset("actions", data=np.array(actions))
+
+        now = datetime.datetime.now()
+        grp.attrs["date"] = "{}-{}-{}".format(now.month, now.day, now.year)
+        grp.attrs["time"] = "{}:{}:{}".format(now.hour, now.minute, now.second)
+        grp.attrs["repository_version"] = suite.__version__
+        grp.attrs["env"] = env_name
+        grp.attrs["env_info"] = env_info
+
+    return len(states), success
 
 
 def next_demo_dir(root):
@@ -530,17 +587,18 @@ def main():
 
     print_launch_banner(args, options, root_dir, action_dim, arm_controller_name)
 
-    # --- collection loop: teleop -> ask y/n -> save numbered demo or reset ---
+    # --- collection loop: teleop -> ALWAYS ask y/n -> save numbered demo or reset ---
     # Each iteration runs a single episode (collect_human_trajectory resets the
-    # env at its start). We then look at just that episode's success flag and:
-    #   * no data / not successful -> discard the episode dir and re-collect.
-    #   * successful               -> ask the user. 'y' gathers exactly that one
-    #                                 episode into the NEXT demos/<Env>_<Robot>/
-    #                                 demo_<N>/demo.hdf5; 'n' discards it and
-    #                                 re-collects (env resets on the next loop).
-    # We delete each episode dir from tmp_directory after handling it (kept or
-    # not), so at gather time tmp holds exactly one episode -> each demo_<N>/
-    # demo.hdf5 contains exactly one demo. Stop anytime with Ctrl+C.
+    # env at its start and calls env.close() when the episode ends -- via 'q' or
+    # a 10-step success hold). We then:
+    #   * if no data was recorded (quit before moving) -> re-collect silently.
+    #   * otherwise ALWAYS prompt the user to save (independent of the env's
+    #     auto-success detection, which is why the prompt now always appears):
+    #       'y' -> save this one episode to the NEXT demos/<Env>_<Robot>/demo_<N>/
+    #              demo.hdf5 (one demo per folder), then continue with the next.
+    #       'n' -> discard it; the env resets on the next loop = re-collect.
+    # We delete each handled episode from tmp_directory so folders stay 1-demo.
+    # Stop anytime with Ctrl+C.
     try:
         while True:
             before = list_episode_dirs(tmp_directory)
@@ -551,17 +609,23 @@ def main():
                 print("[info] 이번 에피소드에서 기록된 데이터가 없습니다. 다시 수집합니다.\n")
                 continue
 
-            if not episode_successful(ep_dir):
-                print("[info] 데모가 성공으로 감지되지 않았습니다. 리셋 후 다시 수집합니다.\n")
-                shutil.rmtree(ep_dir, ignore_errors=True)
-                continue
+            # Informational only: whether the env auto-detected task success.
+            auto_ok = episode_successful(ep_dir)
+            print("[info] 이번 에피소드 task 자동 성공 감지: "
+                  f"{'성공(success)' if auto_ok else '미감지(not flagged)'}")
 
             if ask_keep_demo():
                 out_dir = next_demo_dir(root_dir)          # demos/<Env>_<Robot>/demo_<N>
                 os.makedirs(out_dir, exist_ok=True)
-                gather_demonstrations_as_hdf5(tmp_directory, out_dir, env_info)
-                print(f"\n[saved] {os.path.join(out_dir, 'demo.hdf5')}")
-                print("        다음 데모를 이어서 수집합니다. 종료하려면 Ctrl+C.\n")
+                n_states, _ = save_episode_as_hdf5(ep_dir, out_dir, env_info)
+                if n_states == 0:
+                    # No usable transitions -> remove the empty stub folder.
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    print("[info] 저장할 스텝이 없어 저장을 건너뜁니다. 다시 수집합니다.\n")
+                else:
+                    print(f"\n[saved] {os.path.join(out_dir, 'demo.hdf5')}  "
+                          f"(states={n_states})")
+                    print("        다음 데모를 이어서 수집합니다. 종료하려면 Ctrl+C.\n")
             else:
                 print("[info] 저장하지 않고 리셋 후 다시 수집합니다.\n")
 
