@@ -77,46 +77,43 @@ python collect_demo.py --renderer mujoco --camera agentview
 > 키 입력은 전역 `pynput` 훅으로 잡히므로 렌더 창에 포커스가 없어도 동작합니다.
 > `mjviewer` 창에서는 마우스로 카메라를 움직이세요.
 
-## 🔗 Module-1 파이프라인과 연결 (`--pipeline`)
+## 🔗 Module-1 파이프라인은 collect_demo 를 자동으로 따라옵니다
 
-이 수집기의 출력(hdf5 구조·`env_info`·`demo_<N>` 폴더)은 이미 파이프라인 리더
-(`replay/hdf5_utils.py`)와 **포맷 호환**입니다. 남은 건 **환경/컨트롤러/저장 경로**를
-파이프라인 설정에 맞추는 것뿐이라, 이를 한 번에 해주는 `--pipeline` 프리셋을 넣었습니다.
-
-```bash
-# 프로젝트 루트(ICRA/)에서
-python collect_demo.py --pipeline --num-demos 20
-```
-
-`--pipeline` 이 하는 일:
-
-| 항목 | 고정 값 | 이유 |
-|------|---------|------|
-| 환경 | `PickPlaceCan` | `build_feature_bank` 가 `object_type=can` 을 가정 |
-| 로봇 | `Panda` | config `m1_goal_phase_pickplace_can.yaml` 기준 |
-| 컨트롤러 | `OSC_POSITION` (4-dim) | 파이프라인이 `(T,4)` 액션·`assert_action_dim_4` 를 요구 (팔 롤링 X) |
-| 저장 경로 | `./demos/pickplace_can/demo_<N>/demo.hdf5` | config `demo_root: ./demos/pickplace_can` 와 정확히 일치 |
-
-그래서 수집 직후 바로 다음 단계가 그대로 읽습니다:
+**collect_demo.py 하나로만 수집하면 됩니다.** 별도 옵션 없이 그냥 수집하면, 아래 파이프라인
+코드가 **각 데모의 `env_info`를 읽어 환경·객체·액션 차원을 스스로 맞춥니다.** 더 이상 `can`
+이나 4-dim에 하드코딩되어 있지 않습니다.
 
 ```bash
+# 프로젝트 루트(ICRA/)에서 — 원하는 PickPlace 객체를 골라 수집
+python collect_demo.py --environment PickPlaceCan   --robots Panda --num-demos 20
+python collect_demo.py --environment PickPlaceMilk  --robots Panda --num-demos 20
+# 그대로 다음 단계 (config demo_root: ./demos 아래를 재귀 탐색)
 python feature_bank/build_feature_bank.py --config configs/m1_goal_phase_pickplace_can.yaml
 ```
+
+파이프라인이 collect_demo 에 맞춰 자동 처리하는 것:
+
+| 자동으로 따라오는 것 | 어떻게 |
+|----------------------|--------|
+| **객체 종류** (can/milk/bread/cereal) | `env_info.object_type`(collect_demo 가 기록) → 없으면 env 이름에서 유도. `build_feature_bank` 가 데모별로 결정 |
+| **환경/로봇** | `env_info` 의 `env_name`·`robots` 로 env 재구성 (`replay_states`) |
+| **액션 차원 4/7** | features 는 위치델타 3 + 그리퍼(action[-1])만 사용 → 4-dim/7-dim 모두 15-dim 피처. `assert_action_dim_4` 하드체크 제거 |
+| **저장 경로/여러 환경 혼합** | `find_demo_files` 가 `./demos` 아래 `**/demo.hdf5` 를 **재귀** 탐색. `demos/PickPlaceCan_Panda/…`, `demos/PickPlaceMilk_Panda/…` 를 모두 자동 포함 |
 
 연결 체인:
 
 ```
-collect_demo.py --pipeline
-   └─> demos/pickplace_can/demo_<N>/demo.hdf5   (data/demo_1/{states,actions(T,4)}, env_info)
-          └─> find_demo_files(demo_root) → load_env_info → read_demo   (replay/hdf5_utils.py)
-                 └─> DemoReplayer.replay → compute_features → data/processed/*.npz
+collect_demo.py  (PickPlace 객체 자유 선택, OSC_POSE/OSC_POSITION 무관)
+   └─> demos/<Env>_<Robot>/demo_<N>/demo.hdf5   (states, actions(T,4 또는 T,7), env_info{object_type})
+          └─> find_demo_files(./demos, 재귀) → load_env_info → read_demo   (replay/hdf5_utils.py)
+                 └─> object_type_from_env_info → DemoReplayer.replay → compute_features(15-dim)
                         └─> phase_segmenter/train.py → m1_pipeline.py → (g, z_t)
 ```
 
-> ⚠️ 팔 롤링(자유 회전)이나 다른 환경/로봇으로 수집한 `OSC_POSE`(7-dim) 데모는
-> 이 4-dim 파이프라인과 호환되지 않습니다(일반 데모/시연용). 파이프라인용은 반드시
-> `--pipeline`(또는 `--controller OSC_POSITION --environment PickPlaceCan --robots Panda`)
-> 로 수집하세요.
+> 참고: 이 파이프라인의 "목표 g / 단계(approach…place)"는 **PickPlace 계열(집기-놓기)**
+> 과제를 가정합니다. can/milk/bread/cereal 은 모두 지원되지만, Lift·Door 같은 완전히 다른
+> 과제는 목표·단계 의미가 맞지 않아 `build_feature_bank` 에서 객체/타깃을 못 찾고 명확한
+> 에러를 냅니다.
 
 ## 주요 CLI 옵션
 
@@ -125,7 +122,6 @@ collect_demo.py --pipeline
 | `--environment` | (메뉴) | 환경 이름. 생략 시 터미널 메뉴 |
 | `--robots` | (메뉴) | 로봇 이름(복수 가능). 생략 시 터미널 메뉴 |
 | `--num-demos` | (질문) | 수집할 데모 개수. 생략 시 터미널에서 물어봄. 이 개수만큼 저장되면 종료 |
-| `--pipeline` | off | Module-1 파이프라인 프리셋(PickPlaceCan+Panda+OSC_POSITION → `demos/pickplace_can`) |
 | `--env-configuration` | (메뉴) | TwoArm 환경의 팔 구성(예: `bimanual`) |
 | `--controller` | `OSC_POSE` | `OSC_POSE`(롤링 O, 7-dim) / `OSC_POSITION`(롤링 X, 4-dim) |
 | `--renderer` | `mjviewer` | `mjviewer`(카메라 이동 O) / `mujoco`(OpenCV, 고정 카메라) |
@@ -146,12 +142,12 @@ demos/
     └── ...
 ```
 
-각 `demo_<N>/demo.hdf5` 는 `gather_demonstrations_as_hdf5` 를 그대로 재사용해
-기존과 동일한 HDF5 구조(`data/demo_i/{states, actions}`, `data.attrs.env_info`)로
-저장되며, 폴더당 **데모 1개**만 들어갑니다. `env_info` JSON 에 `action_dim`,
-`arm_controller` 가 기록되어 다운스트림에서 액션 차원을 검증할 수 있습니다.
+각 `demo_<N>/demo.hdf5` 는 로봇수트 기본과 동일한 HDF5 구조
+(`data/demo_i/{states, actions}`, `data.attrs.env_info`)로 저장되며, 폴더당
+**데모 1개**만 들어갑니다. `env_info` JSON 에 `action_dim`, `arm_controller`,
+그리고 PickPlace 환경이면 `object_type`(can/milk/…)까지 기록되어, 다운스트림이
+데모마다 환경·객체·액션 차원을 그대로 따라옵니다.
 
-> ⚠️ `OSC_POSE` 로 수집하면 액션이 **7-dim** 이라 이 프로젝트의 4-dim 파이프라인
-> (`feature_bank/build_feature_bank.py` 등)과는 호환되지 않습니다. 파이프라인용
-> 데이터는 `--controller OSC_POSITION` 으로 수집하세요. 팔 롤링/자유 카메라는
-> 일반 데모 확인·시연용입니다.
+> ✅ `OSC_POSE`(7-dim, 팔 롤링)든 `OSC_POSITION`(4-dim)이든 **둘 다 파이프라인에서
+> 학습 가능**합니다. features 가 위치델타 3개 + 그리퍼만 쓰므로 액션 차원과 무관하게
+> 15-dim 피처가 됩니다. (다른 과제가 아니라 PickPlace 계열 객체를 쓰는 한.)

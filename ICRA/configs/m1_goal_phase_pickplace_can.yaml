@@ -12,16 +12,19 @@
 
 # ---- I/O -------------------------------------------------------------------
 paths:
-  demo_root: ./demos/pickplace_can        # each run subdir holds a demo.hdf5
+  demo_root: ./demos                      # recursive: finds demos/<Env>_<Robot>/demo_<N>/demo.hdf5
   processed_out: ./data/processed         # per-demo feature/label/(g,z_t) .npz
   reports_out: ./data/reports             # visualize.py PNG + CSV
   checkpoint_dir: ./checkpoints/phase_segmenter   # norm_stats.npz + best.pt
 
 # ---- Task / object ---------------------------------------------------------
+# NOTE: object_type is now resolved PER DEMO from each demo's stored env_info
+# (PickPlaceCan -> "can", PickPlaceMilk -> "milk", ...), so mixing objects in one
+# demo_root works. The values below are only a FALLBACK for demos whose env_info
+# lacks the info (e.g. a bare "PickPlace" env with all four objects).
 task:
-  object_name: Can          # robosuite object name (obj_body_id key); lowercase
-                            # "can" is the object_to_id key. See name_lookup.py.
-  object_type: can          # key into env.object_to_id / target_bin_placements
+  object_name: Can          # fallback robosuite object name
+  object_type: can          # fallback key into env.object_to_id / target_bin_placements
 
 # ---- Phase label space -----------------------------------------------------
 # Order defines the integer id of each phase (0..K-1). "stabilize" is optional;

@@ -128,13 +128,18 @@ def inspect(path):
                 for a in other_attrs:
                     print(f"    attr {a}: {_fmt_attr(grp.attrs[a])}")
 
-        # --- action-dim summary (the thing that matters for the pipeline) ---
+        # --- action-dim summary (pipeline accepts 4-dim OSC_POSITION or 7-dim OSC_POSE) ---
         print("\n" + "-" * 70)
+        _labels = {4: "OSC_POSITION (3 pos + 1 gripper)", 7: "OSC_POSE (3 pos + 3 rot + 1 gripper)"}
         if action_dims == {4}:
             print("action dim across demos: 4  ->  OSC_POSITION (3 pos + 1 gripper)  [OK]")
+        elif action_dims == {7}:
+            print("action dim across demos: 7  ->  OSC_POSE (3 pos + 3 rot + 1 gripper)  [OK]")
+        elif action_dims and action_dims <= {4, 7}:
+            print(f"action dim(s) across demos: {sorted(action_dims)}  [OK: 4 and/or 7 both supported]")
         elif action_dims:
             print(f"action dim(s) across demos: {sorted(action_dims)}  "
-                  f"{'[WARNING: expected 4]' if action_dims != {4} else ''}")
+                  f"[WARNING: pipeline expects 4 or 7 (>=3 pos + gripper)]")
         else:
             print("no 2-D action datasets found to determine action dim.")
         print("=" * 70 + "\n")

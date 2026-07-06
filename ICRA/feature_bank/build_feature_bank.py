@@ -41,14 +41,42 @@ from goal.extract_goal import extract_goal
 
 
 def _processed_name(hdf5_path, demo_key):
-    """Stable output stem: '<run-folder>__<demo_key>'."""
-    run = os.path.basename(os.path.dirname(hdf5_path)) or "root"
-    return f"{run}__{demo_key}"
+    """Stable, collision-free output stem: '<env-folder>__<run-folder>__<demo_key>'.
+
+    collect_demo.py writes demos as ``demos/<Env>_<Robot>/demo_<N>/demo.hdf5``, so
+    the run folder (``demo_<N>``) restarts at demo_1 for EACH environment. Include
+    the parent (``<Env>_<Robot>``) folder so features from different environments
+    don't overwrite each other in data/processed/.
+    """
+    run = os.path.basename(os.path.dirname(hdf5_path)) or "root"          # demo_<N>
+    parent = os.path.basename(os.path.dirname(os.path.dirname(hdf5_path)))  # <Env>_<Robot>
+    stem = f"{parent}__{run}" if parent else run
+    return f"{stem}__{demo_key}"
+
+
+def object_type_from_env_info(env_info, fallback="can"):
+    """Resolve the PickPlace object type for a demo from its stored env_info.
+
+    "Everything follows collect_demo": prefer an explicit ``object_type`` written
+    by the collector; else derive it from the env name (``PickPlaceCan`` -> "can",
+    ``PickPlaceMilk`` -> "milk", ...); else fall back to the config value.
+    """
+    ot = env_info.get("object_type")
+    if ot:
+        return str(ot).lower()
+    name = str(env_info.get("env_name", ""))
+    if name.startswith("PickPlace") and len(name) > len("PickPlace"):
+        return name[len("PickPlace"):].lower()   # PickPlaceMilk -> "milk"
+    return fallback
 
 
 def build_one_demo(replayer, env_info, demo, cfg):
-    """Replay one demo -> (features (T,D), actions (T,4), extras dict)."""
-    object_type = cfg.get("task", {}).get("object_type", "can")
+    """Replay one demo -> (features (T,D), actions (T,A), extras dict).
+
+    Actions may be 4-dim (OSC_POSITION) or 7-dim (OSC_POSE); features only use the
+    position deltas + gripper, so the feature dim is 15 regardless.
+    """
+    object_type = object_type_from_env_info(env_info, cfg.get("task", {}).get("object_type", "can"))
     states = demo["states"]
     actions = np.asarray(demo["actions"], dtype=np.float32)
     T = states.shape[0]

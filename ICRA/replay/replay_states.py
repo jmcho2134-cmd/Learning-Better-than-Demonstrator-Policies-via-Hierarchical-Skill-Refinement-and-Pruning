@@ -28,19 +28,19 @@ only sim state, so this is fast and display-free.
 
 import numpy as np
 
-from replay.hdf5_utils import make_kwargs_from_env_info, assert_action_dim_4
+from replay.hdf5_utils import make_kwargs_from_env_info, assert_supported_action_dim
 
 
 def build_env(env_info, render=False):
-    """Create the (unwrapped) PickPlaceCan env from stored metadata.
+    """Create the (unwrapped) PickPlace-family env from stored metadata.
 
     Mirrors the collector / playback script's construction, but headless by
-    default. Fails loudly if the resulting action space is not 4-dim, matching
-    collect_pickplace_can.py's guarantee.
+    default. Accepts any action space with >= 4 dims (4-dim OSC_POSITION or 7-dim
+    OSC_POSE); feature extraction only uses the 3 position deltas + gripper.
     """
     import robosuite  # local import: authoring must not import robosuite
 
-    assert_action_dim_4(env_info)
+    assert_supported_action_dim(env_info)
     make_kwargs, control_freq = make_kwargs_from_env_info(env_info)
 
     env = robosuite.make(
@@ -53,13 +53,13 @@ def build_env(env_info, render=False):
         control_freq=control_freq if control_freq is not None else 20,
     )
 
-    # HARD action-dim check (env.action_spec is valid right after make()).
+    # Soft check (env.action_spec is valid right after make()): need >= 4 dims.
     action_dim = int(env.action_spec[0].shape[0])
-    if action_dim != 4:
+    if action_dim < 4:
         env.close()
         raise SystemExit(
-            f"rebuilt env has action_dim={action_dim}, expected 4 (OSC_POSITION). "
-            "The stored controller_configs did not reproduce the 4-dim action space."
+            f"rebuilt env has action_dim={action_dim}, need >= 4 (>=3 pos + gripper). "
+            "The stored controller_configs did not reproduce a usable action space."
         )
     return env
 

@@ -27,22 +27,23 @@ import os
 # Finding demo files
 # ---------------------------------------------------------------------------
 def find_demo_files(demo_root):
-    """Return a sorted list of every ``demo.hdf5`` under ``demo_root``.
+    """Return a sorted list of every ``demo.hdf5`` at or under ``demo_root``.
 
-    Matches the collector's layout ``demo_root/<run>/demo.hdf5`` (either the new
-    ``demo_<N>`` folders or the older ``<t1>_<t2>`` timestamp folders). Also
-    accepts a ``demo.hdf5`` sitting directly in ``demo_root``.
+    Searches RECURSIVELY, so it matches both the flat collector layout
+    ``demo_root/<run>/demo.hdf5`` and collect_demo.py's per-environment layout
+    ``demo_root/<Env>_<Robot>/demo_<N>/demo.hdf5`` (any depth). Also accepts a
+    ``demo.hdf5`` sitting directly in ``demo_root``. Deduped + sorted.
     """
     if not os.path.isdir(demo_root):
         raise SystemExit(
             f"demo_root does not exist: {demo_root}\n"
-            "Collect demos first, e.g.:  python collect_pickplace_can.py --random-can"
+            "Collect demos first, e.g.:  python collect_demo.py"
         )
-    hits = sorted(glob.glob(os.path.join(demo_root, "*", "demo.hdf5")))
+    hits = set(glob.glob(os.path.join(demo_root, "**", "demo.hdf5"), recursive=True))
     direct = os.path.join(demo_root, "demo.hdf5")
     if os.path.isfile(direct):
-        hits = [direct] + hits
-    return hits
+        hits.add(direct)
+    return sorted(hits)
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +85,25 @@ def make_kwargs_from_env_info(env_info):
     return make_kwargs, control_freq
 
 
-def assert_action_dim_4(env_info):
-    """Fail loudly if the stored metadata is not the 4-dim OSC_POSITION space."""
+def assert_supported_action_dim(env_info):
+    """Fail loudly only if the stored action space cannot drive the pipeline.
+
+    The pipeline is action-dim agnostic between 4-dim OSC_POSITION (3 pos +
+    gripper) and 7-dim OSC_POSE (3 pos + 3 rot + gripper); feature extraction
+    uses only the 3 position deltas and the last (gripper) element. Anything with
+    fewer than 4 dims (no room for 3 pos + gripper) is rejected.
+    """
     ad = env_info.get("action_dim")
-    if ad is not None and int(ad) != 4:
+    if ad is not None and int(ad) < 4:
         raise SystemExit(
-            f"env_info reports action_dim={ad}, expected 4 (OSC_POSITION). "
-            "These demos are incompatible with the 4-dim downstream pipeline."
+            f"env_info reports action_dim={ad}, need >= 4 (>=3 position deltas + "
+            "1 gripper). These demos cannot drive the pipeline."
         )
+
+
+# Backwards-compatible alias (older code / callers referenced the 4-dim name).
+def assert_action_dim_4(env_info):
+    return assert_supported_action_dim(env_info)
 
 
 # ---------------------------------------------------------------------------
