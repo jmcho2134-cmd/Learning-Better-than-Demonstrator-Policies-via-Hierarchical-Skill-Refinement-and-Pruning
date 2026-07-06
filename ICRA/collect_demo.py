@@ -421,8 +421,14 @@ def save_episode_as_hdf5(ep_dir, out_dir, env_info):
     with h5py.File(hdf5_path, "w") as f:
         grp = f.create_group("data")
         ep_grp = grp.create_group("demo_1")  # one demo per demo_<N>/ folder
-        with open(os.path.join(ep_dir, "model.xml"), "r") as xml_f:
-            ep_grp.attrs["model_file"] = xml_f.read()
+        # model.xml is written by DataCollectionWrapper on first interaction, so
+        # it should always exist; guard anyway so a missing xml doesn't crash.
+        xml_path = os.path.join(ep_dir, "model.xml")
+        if os.path.exists(xml_path):
+            with open(xml_path, "r") as xml_f:
+                ep_grp.attrs["model_file"] = xml_f.read()
+        else:
+            print(f"[warn] model.xml not found in {ep_dir}; saving without model_file attr.")
         ep_grp.create_dataset("states", data=np.array(states))
         ep_grp.create_dataset("actions", data=np.array(actions))
 
@@ -470,6 +476,22 @@ def ask_keep_demo():
         print("   y(저장) 또는 n(리셋 후 재수집) 으로 답해주세요.")
 
 
+def ask_num_demos():
+    """Prompt (Korean) for how many demos to collect. Returns a positive int.
+
+    Loops until a positive integer is entered. Ctrl+D (EOF) defaults to 1.
+    """
+    while True:
+        try:
+            ans = input(">> 몇 개의 데모를 수집하시겠습니까? (정수 입력): ").strip()
+        except EOFError:
+            print("   (입력 없음 -> 1개로 진행합니다.)")
+            return 1
+        if ans.isdigit() and int(ans) > 0:
+            return int(ans)
+        print("   1 이상의 정수를 입력해주세요.")
+
+
 # ---------------------------------------------------------------------------
 # Version-robust wrapper around robosuite's collect_human_trajectory
 # ---------------------------------------------------------------------------
@@ -497,6 +519,9 @@ def main():
                         help="robosuite environment name. Omit to pick from a terminal menu.")
     parser.add_argument("--robots", nargs="+", type=str, default=None,
                         help="Robot model(s). Omit to pick from a terminal menu.")
+    parser.add_argument("--num-demos", type=int, default=None,
+                        help="How many demos to collect (saved with 'y'). Omit to be asked in the "
+                             "terminal. Collection stops once this many demos are saved.")
     parser.add_argument("--env-configuration", type=str, default=None,
                         help="Two-arm configuration (e.g. 'bimanual'). Omit to pick from a menu "
                              "for TwoArm envs.")
@@ -533,6 +558,9 @@ def main():
 
     # --- interactive (or CLI) environment/robot selection ---
     options = choose_options_interactively(args)
+
+    # --- how many demos to collect (asked in the terminal unless given on CLI) ---
+    num_demos = args.num_demos if (args.num_demos and args.num_demos > 0) else ask_num_demos()
 
     # --- controller config: set the chosen arm controller ---
     # load_composite_controller_config wants a single robot name; use the first.
@@ -587,20 +615,31 @@ def main():
 
     print_launch_banner(args, options, root_dir, action_dim, arm_controller_name)
 
-    # --- collection loop: teleop -> ALWAYS ask y/n -> save numbered demo or reset ---
+    # --- collection loop: collect exactly `num_demos` accepted demos ---
     # Each iteration runs a single episode (collect_human_trajectory resets the
     # env at its start and calls env.close() when the episode ends -- via 'q' or
     # a 10-step success hold). We then:
     #   * if no data was recorded (quit before moving) -> re-collect silently.
-    #   * otherwise ALWAYS prompt the user to save (independent of the env's
-    #     auto-success detection, which is why the prompt now always appears):
+    #   * otherwise ALWAYS prompt to save (independent of the env's auto-success
+    #     detection, so the prompt always appears):
     #       'y' -> save this one episode to the NEXT demos/<Env>_<Robot>/demo_<N>/
-    #              demo.hdf5 (one demo per folder), then continue with the next.
+    #              demo.hdf5 (one demo per folder); count it toward num_demos.
     #       'n' -> discard it; the env resets on the next loop = re-collect.
-    # We delete each handled episode from tmp_directory so folders stay 1-demo.
-    # Stop anytime with Ctrl+C.
+    # Only accepted ('y') demos count, so a bad take that you reject does not use
+    # up one of your num_demos. The loop ends once `saved` reaches num_demos.
+    #
+    # IMPORTANT: we do NOT delete the episode folders under tmp_directory. On the
+    # next env.reset(), DataCollectionWrapper flushes any leftover buffer into the
+    # PREVIOUS episode's folder; deleting that folder here would make the next
+    # reset write into a missing path -> FileNotFoundError. Each demo_<N>/demo.hdf5
+    # still holds exactly one demo because we save one specific ep_dir per accept.
+    # tmp_directory lives under /tmp and is best-effort cleaned on exit.
+    print(f"[info] 이번 세션에서 {num_demos}개의 데모를 수집합니다.\n")
+    saved = 0
     try:
-        while True:
+        while saved < num_demos:
+            print(f"===== 데모 {saved + 1}/{num_demos} 수집 시작 "
+                  f"(창에서 조작, 끝나면 q) =====")
             before = list_episode_dirs(tmp_directory)
             run_one_episode(env, device, args)
 
@@ -619,26 +658,27 @@ def main():
                 os.makedirs(out_dir, exist_ok=True)
                 n_states, _ = save_episode_as_hdf5(ep_dir, out_dir, env_info)
                 if n_states == 0:
-                    # No usable transitions -> remove the empty stub folder.
+                    # No usable transitions -> remove the empty stub folder, retry.
                     shutil.rmtree(out_dir, ignore_errors=True)
                     print("[info] 저장할 스텝이 없어 저장을 건너뜁니다. 다시 수집합니다.\n")
-                else:
-                    print(f"\n[saved] {os.path.join(out_dir, 'demo.hdf5')}  "
-                          f"(states={n_states})")
-                    print("        다음 데모를 이어서 수집합니다. 종료하려면 Ctrl+C.\n")
+                    continue
+                saved += 1
+                print(f"\n[saved {saved}/{num_demos}] {os.path.join(out_dir, 'demo.hdf5')}  "
+                      f"(states={n_states})\n")
             else:
                 print("[info] 저장하지 않고 리셋 후 다시 수집합니다.\n")
 
-            # Clear the just-handled episode so the next accepted demo is written
-            # to its own (single-demo) demo_<N>/demo.hdf5.
-            shutil.rmtree(ep_dir, ignore_errors=True)
+        print(f"[done] 목표한 {num_demos}개 데모 수집 완료. 저장 위치: {root_dir}")
     except KeyboardInterrupt:
-        print(f"\n[done] 사용자에 의해 중단되었습니다. 저장 위치: {root_dir}")
+        print(f"\n[done] 사용자에 의해 중단되었습니다. ({saved}/{num_demos} 저장) "
+              f"저장 위치: {root_dir}")
+    finally:
         try:
             env.close()
         except Exception:
             pass
-        return
+        # best-effort cleanup of the raw episode dumps under /tmp
+        shutil.rmtree(tmp_directory, ignore_errors=True)
 
 
 if __name__ == "__main__":
