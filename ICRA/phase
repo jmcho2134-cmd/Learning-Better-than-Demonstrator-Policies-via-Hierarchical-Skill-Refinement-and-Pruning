@@ -1,0 +1,401 @@
+#!/usr/bin/env python
+"""
+plot_features.py
+================
+
+Replay demos collected by ``collect_demo.py`` and PLOT the core progress
+features over time. No segmentation here on purpose: the point is to *eyeball*
+whether Approach / Grasp / Lift / Transport / Place are visible in the feature
+curves before committing to any segmenter.
+
+Connects to collect_demo.py
+---------------------------
+It reads the exact HDF5 layout collect_demo.py writes:
+
+    data/                         (group)   attrs: env, env_info, date, time, ...
+      demo_1/                     (group)   attrs: model_file  (scene XML string)
+        states   (T, S)  float    flattened MuJoCo sim.get_state()
+        actions  (T, A)  float    (OSC_POSITION -> A=4)
+
+``env_info`` (JSON string on the ``data`` group) carries env_name / robots /
+controller_configs / control_freq and, for PickPlace-family envs, object_type
+(e.g. "can"). collect_demo.py already dropped the trailing state, so
+len(states) == len(actions) and we just iterate every saved state.
+
+How replay works (and why it is deterministic)
+----------------------------------------------
+We reconstruct the exact scene from ``model_file`` and then, for each saved
+state, call ``sim.set_state_from_flattened(state); sim.forward()`` and read the
+features off ``sim.data``. Because we SET the state directly (we never step a
+policy), feature extraction is deterministic and independent of any RNG/seed.
+This mirrors robosuite's own scripts/playback_demonstrations_from_hdf5.py.
+
+Features plotted (all relative -> generalize across can positions)
+------------------------------------------------------------------
+  eef_object_dist   ||eef - object||           -> falls during Approach
+  gripper_open      sum(|gripper qpos|)          -> drops at Grasp, rises at Place
+  object_height     object_z - object_z[0]       -> rises during Lift
+  object_goal_dist  ||object - object[T_final]||  -> falls during Transport
+                    (goal = final object placement in this demo, per the
+                     proposal's "final object placement" goal option; this needs
+                     no fragile bin-target lookup and ->0 at the end)
+
+Outputs (per demo, written next to demo.hdf5 unless --out-dir given)
+-------------------------------------------------------------------
+  <demo_dir>/features.png   the plot
+  <demo_dir>/features.npz   the raw extracted feature arrays (so this doubles as
+                            the start of a replay_features step later)
+
+Usage (activate the conda ``robosuite`` env first)
+--------------------------------------------------
+    python plot_features.py                      # scans ./demos recursively
+    python plot_features.py --demo-root ./demos
+    python plot_features.py --debug-keys         # print obs keys + object bodies
+    python plot_features.py --max-demos 4        # only the first few
+
+===================  VERIFY THESE 3 API POINTS ON YOUR ROBOSUITE  ===============
+This file was written WITHOUT a live robosuite to test against. Run once with
+--debug-keys; if anything below is named differently in your build, the debug
+print tells you the real names and you fix the small mapping.
+
+  (1) suite.make(env_name=..., robots=..., controller_configs=..., control_freq=...)
+      -- we pass ONLY valid make kwargs and drop the extra env_info keys
+         (action_dim / arm_controller / object_type) that make() does not accept.
+  (2) env.reset_from_xml_string(model_xml)  (+ optional postprocess_model_xml).
+  (3) obs keys 'robot0_eef_pos' / 'robot0_gripper_qpos' via
+      env._get_observations(force_update=True), and object body via
+      env.objects[i].root_body -> env.sim.data.get_body_xpos(body).
+================================================================================
+"""
+
+import argparse
+import json
+import os
+from glob import glob
+
+import numpy as np
+import h5py
+
+import matplotlib
+matplotlib.use("Agg")  # headless: write PNGs, never open a window
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
+
+import robosuite as suite
+
+
+# ---------------------------------------------------------------------------
+# HDF5 reading (collect_demo.py layout)
+# ---------------------------------------------------------------------------
+def read_demo(hdf5_path):
+    """Return (env_info: dict, demos: list of (name, states, actions, model_xml))."""
+    with h5py.File(hdf5_path, "r") as f:
+        data = f["data"]
+        env_info = json.loads(data.attrs["env_info"])
+        demos = []
+        # collect_demo.py writes exactly one group 'demo_1', but iterate to be safe.
+        for name in data:
+            grp = data[name]
+            if "states" not in grp or "actions" not in grp:
+                continue
+            states = grp["states"][()]
+            actions = grp["actions"][()]
+            model_xml = grp.attrs.get("model_file", None)
+            demos.append((name, states, actions, model_xml))
+    return env_info, demos
+
+
+# ---------------------------------------------------------------------------
+# Environment construction / scene reset (version-robust)
+# ---------------------------------------------------------------------------
+def make_valid_make_kwargs(env_info):
+    """Keep only kwargs suite.make() accepts; drop collect_demo.py's extras."""
+    kwargs = dict(
+        env_name=env_info["env_name"],
+        robots=env_info["robots"],
+        controller_configs=env_info.get("controller_configs"),
+        control_freq=env_info.get("control_freq", 20),
+        has_renderer=False,
+        has_offscreen_renderer=False,
+        ignore_done=True,
+        use_camera_obs=False,
+        reward_shaping=True,
+    )
+    # env_info also holds action_dim / arm_controller / object_type -> NOT make() kwargs.
+    return kwargs
+
+
+def build_env(env_info):
+    return suite.make(**make_valid_make_kwargs(env_info))
+
+
+def reset_to_scene(env, model_xml):
+    """Reset env to the demo's exact scene. Handles robosuite version differences.
+
+    Older robosuite needs postprocess_model_xml() to fix asset paths; 1.5 usually
+    does not. We apply it only if importable and if its signature is simple.
+    """
+    env.reset()
+    if model_xml is None:
+        print("[warn] demo has no model_file attr; using default scene "
+              "(can position may not match the demo!)")
+        return
+    xml = model_xml
+    try:
+        from robosuite.utils.mjcf_utils import postprocess_model_xml
+        import inspect
+        # Some versions take (xml_str), some (xml_str, cameras). Call the simple form.
+        if len(inspect.signature(postprocess_model_xml).parameters) == 1:
+            xml = postprocess_model_xml(model_xml)
+    except Exception:
+        xml = model_xml  # not available / not needed in this version
+    env.reset_from_xml_string(xml)
+    env.sim.reset()
+    env.sim.forward()
+
+
+# ---------------------------------------------------------------------------
+# Resolving which body is the manipulated object
+# ---------------------------------------------------------------------------
+def resolve_object_body(env, object_type):
+    """Return the MuJoCo body name of the manipulated object, or None.
+
+    Primary: match env.objects by name against object_type ("can" -> "Can").
+    Fallback: first object. Non-PickPlace envs may have no .objects -> None,
+    in which case we later fall back to an observable '*_pos' key.
+    """
+    objs = getattr(env, "objects", None)
+    if not objs:
+        return None
+    if object_type:
+        for o in objs:
+            if object_type.lower() in getattr(o, "name", "").lower():
+                return o.root_body
+    return objs[0].root_body
+
+
+def debug_print_available(env, object_type):
+    """Print observable keys + object bodies so the user can fix name mappings."""
+    print("\n--------------- DEBUG: available names ---------------")
+    try:
+        obs = env._get_observations(force_update=True)
+        keys = sorted(obs.keys())
+        print("observable keys:")
+        for k in keys:
+            shp = np.asarray(obs[k]).shape if np.ndim(obs[k]) else "()"
+            print(f"    {k}    {shp}")
+    except Exception as e:
+        print(f"  [could not read observations: {e}]")
+    objs = getattr(env, "objects", None)
+    if objs:
+        print("env.objects:")
+        for o in objs:
+            print(f"    name={getattr(o, 'name', '?')}   root_body={getattr(o, 'root_body', '?')}")
+    print(f"object_type from env_info: {object_type}")
+    print("------------------------------------------------------\n")
+
+
+# ---------------------------------------------------------------------------
+# Per-frame feature extraction
+# ---------------------------------------------------------------------------
+def get_observations(env):
+    """Force-recompute observables from the current (set) sim state."""
+    try:
+        return env._get_observations(force_update=True)
+    except TypeError:
+        return env._get_observations()
+
+
+def extract_frame(env, obj_body):
+    """Read raw quantities for the current sim state.
+
+    Returns dict with eef_pos (3,), obj_pos (3,), gripper_qpos (k,).
+    eef/gripper come from stable observable keys; object pos from body xpos
+    (falls back to an observable '*_pos' key if the body name is unknown).
+    """
+    obs = get_observations(env)
+
+    # end-effector position
+    if "robot0_eef_pos" in obs:
+        eef_pos = np.asarray(obs["robot0_eef_pos"], dtype=float).copy()
+    else:
+        raise KeyError("no 'robot0_eef_pos' in observations; run --debug-keys "
+                       "and set the correct eef key.")
+
+    # gripper opening (proxy = sum of |finger qpos|; larger = more open for Panda)
+    if "robot0_gripper_qpos" in obs:
+        gq = np.asarray(obs["robot0_gripper_qpos"], dtype=float).copy()
+    else:
+        gq = np.zeros(1)
+
+    # object position
+    if obj_body is not None:
+        obj_pos = np.asarray(env.sim.data.get_body_xpos(obj_body), dtype=float).copy()
+    else:
+        # fallback: first observable key ending in '_pos' that isn't robot/gripper
+        cand = [k for k in obs
+                if k.endswith("_pos") and not k.startswith("robot") and "gripper" not in k]
+        if not cand:
+            raise KeyError("could not find object position; run --debug-keys.")
+        obj_pos = np.asarray(obs[cand[0]], dtype=float).copy()
+
+    return dict(eef_pos=eef_pos, obj_pos=obj_pos, gripper_qpos=gq)
+
+
+def replay_and_extract(env, states, obj_body):
+    """Set each saved state, forward the sim, collect per-frame raw arrays."""
+    eef, obj, grip = [], [], []
+    for state in states:
+        env.sim.set_state_from_flattened(state)
+        env.sim.forward()
+        fr = extract_frame(env, obj_body)
+        eef.append(fr["eef_pos"])
+        obj.append(fr["obj_pos"])
+        grip.append(fr["gripper_qpos"])
+    return np.array(eef), np.array(obj), np.array(grip)
+
+
+def compute_progress_features(eef, obj, grip):
+    """Turn raw arrays into the 4 named 1-D progress signals over time."""
+    eef_object_dist = np.linalg.norm(eef - obj, axis=1)
+    object_height = obj[:, 2] - obj[0, 2]                       # rise above start
+    goal = obj[-1]                                              # final placement
+    object_goal_dist = np.linalg.norm(obj - goal[None, :], axis=1)
+    gripper_open = np.sum(np.abs(grip), axis=1)
+    return {
+        "eef_object_dist": eef_object_dist,
+        "gripper_open": gripper_open,
+        "object_height": object_height,
+        "object_goal_dist": object_goal_dist,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+def _norm01(x):
+    x = np.asarray(x, dtype=float)
+    lo, hi = np.min(x), np.max(x)
+    return (x - lo) / (hi - lo) if hi > lo else np.zeros_like(x)
+
+
+def plot_demo(feats, dt, out_png, title):
+    """Top: normalized overlay (phase shapes). Below: 2x2 raw feature panels."""
+    order = ["eef_object_dist", "gripper_open", "object_height", "object_goal_dist"]
+    T = len(next(iter(feats.values())))
+    t = np.arange(T) * dt
+
+    fig = plt.figure(figsize=(11, 8))
+    gs = gridspec.GridSpec(3, 2, height_ratios=[1.3, 1, 1], hspace=0.45, wspace=0.25)
+
+    # overlay (normalized) -- this is where phases become visible
+    ax0 = fig.add_subplot(gs[0, :])
+    for name in order:
+        ax0.plot(t, _norm01(feats[name]), label=name, linewidth=1.8)
+    ax0.set_title(title + "  —  normalized overlay (look for the phase structure)")
+    ax0.set_xlabel("time (s)")
+    ax0.set_ylabel("normalized [0,1]")
+    ax0.legend(loc="upper right", fontsize=8)
+    ax0.grid(True, alpha=0.3)
+
+    # raw panels
+    cells = [gs[1, 0], gs[1, 1], gs[2, 0], gs[2, 1]]
+    hints = {
+        "eef_object_dist": "↓ Approach",
+        "gripper_open": "↓ Grasp  /  ↑ Place",
+        "object_height": "↑ Lift",
+        "object_goal_dist": "↓ Transport",
+    }
+    for cell, name in zip(cells, order):
+        ax = fig.add_subplot(cell)
+        ax.plot(t, feats[name], linewidth=1.6)
+        ax.set_title(f"{name}   ({hints[name]})", fontsize=9)
+        ax.set_xlabel("time (s)")
+        ax.grid(True, alpha=0.3)
+
+    fig.savefig(out_png, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        description="Replay collect_demo.py demos and plot progress features "
+                    "(no segmentation).")
+    ap.add_argument("--demo-root", default=os.path.join(".", "demos"),
+                    help="Root dir to scan recursively for demo.hdf5 "
+                         "(matches collect_demo.py's output layout).")
+    ap.add_argument("--pattern", default="demo.hdf5",
+                    help="HDF5 filename to look for under --demo-root.")
+    ap.add_argument("--out-dir", default=None,
+                    help="Where to write plots/npz. Default: next to each demo.hdf5.")
+    ap.add_argument("--max-demos", type=int, default=0,
+                    help="If >0, only process this many demos.")
+    ap.add_argument("--debug-keys", action="store_true",
+                    help="Print available observable keys + object bodies on the "
+                         "first demo, then continue.")
+    args = ap.parse_args()
+
+    paths = sorted(glob(os.path.join(args.demo_root, "**", args.pattern), recursive=True))
+    if not paths:
+        raise SystemExit(f"No '{args.pattern}' found under {args.demo_root}. "
+                         f"Collect demos with collect_demo.py first.")
+    if args.max_demos and args.max_demos > 0:
+        paths = paths[:args.max_demos]
+    print(f"[info] found {len(paths)} demo file(s).")
+
+    env_cache = {}   # signature -> env, so we reuse one env per (env_name, robots)
+    debugged = False
+
+    try:
+        for hp in paths:
+            env_info, demos = read_demo(hp)
+            sig = (env_info["env_name"],
+                   tuple(env_info["robots"]) if isinstance(env_info["robots"], (list, tuple))
+                   else (env_info["robots"],),
+                   env_info.get("control_freq", 20))
+            if sig not in env_cache:
+                print(f"[info] building env for {sig[0]} / {sig[1]} ...")
+                env_cache[sig] = build_env(env_info)
+            env = env_cache[sig]
+
+            dt = 1.0 / float(env_info.get("control_freq", 20))
+            object_type = env_info.get("object_type", None)
+
+            for name, states, actions, model_xml in demos:
+                reset_to_scene(env, model_xml)
+
+                if args.debug_keys and not debugged:
+                    debug_print_available(env, object_type)
+                    debugged = True
+
+                obj_body = resolve_object_body(env, object_type)
+                eef, obj, grip = replay_and_extract(env, states, obj_body)
+                feats = compute_progress_features(eef, obj, grip)
+
+                out_dir = args.out_dir or os.path.dirname(hp)
+                os.makedirs(out_dir, exist_ok=True)
+                tag = os.path.basename(os.path.dirname(hp)) or name
+                out_png = os.path.join(out_dir, f"features_{tag}.png"
+                                       if args.out_dir else "features.png")
+                out_npz = os.path.join(out_dir, f"features_{tag}.npz"
+                                       if args.out_dir else "features.npz")
+
+                np.savez(out_npz, eef_pos=eef, obj_pos=obj, gripper_qpos=grip,
+                         dt=dt, **feats)
+                plot_demo(feats, dt, out_png, title=f"{env_info['env_name']} / {tag}")
+                print(f"[ok] {hp}  ->  {out_png}  (T={len(states)})")
+
+        print("[done] all demos plotted. Open the features_*.png files.")
+    finally:
+        for env in env_cache.values():
+            try:
+                env.close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()
