@@ -1,0 +1,71 @@
+#!/usr/bin/env python
+"""check_actions.py — is the demo's rotation really zero, or just too small to see?
+
+The action panel pins its y-axis to [-1.15, 1.15] so the controller's box is
+visible (that headroom is what the clip guard is about). The cost: a teleop
+rotation of +-0.05 is 4% of that axis and reads as a flat line at zero. This
+prints the numbers instead of drawing them.
+
+    python check_actions.py --demo-root ./demos
+"""
+import argparse, json, os
+from glob import glob
+import numpy as np
+import h5py
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--demo-root", default=os.path.join(".", "demos"))
+    ap.add_argument("--pattern", default="demo.hdf5")
+    args = ap.parse_args()
+
+    for hp in sorted(glob(os.path.join(args.demo_root, "**", args.pattern),
+                          recursive=True)):
+        with h5py.File(hp, "r") as f:
+            data = f["data"]
+            info = json.loads(data.attrs["env_info"])
+            print(f"\n=== {hp} ===")
+            cc = info.get("controller_configs")
+            ctype = (cc.get("type") if isinstance(cc, dict) else
+                     str(cc)[:60] if cc else "?")
+            print(f"controller: {ctype}")
+            for name in data:
+                g = data[name]
+                if "actions" not in g:
+                    continue
+                A = g["actions"][()]
+                print(f"\n{name}: actions {A.shape}")
+                lab = (["dx", "dy", "dz", "drx", "dry", "drz", "grip"]
+                       if A.shape[1] >= 7 else ["dx", "dy", "dz", "grip"])
+                print(f"  {'dim':<6}{'min':>9}{'max':>9}{'|mean|':>9}"
+                      f"{'nonzero%':>10}{'  verdict'}")
+                for j, n in enumerate(lab[:A.shape[1]]):
+                    col = A[:, j]
+                    nz = float(np.mean(np.abs(col) > 1e-6)) * 100
+                    if nz < 1:
+                        v = "ALL ZERO -- this dim was never commanded"
+                    elif np.abs(col).max() < 0.25:
+                        v = f"small: peaks at {np.abs(col).max():.3f}, so a " \
+                            f"[-1,1] axis shows it as a flat line"
+                    else:
+                        v = "used"
+                    print(f"  {n:<6}{col.min():>9.4f}{col.max():>9.4f}"
+                          f"{np.abs(col).mean():>9.4f}{nz:>9.1f}%  {v}")
+                if A.shape[1] >= 7:
+                    rot = np.abs(A[:, 3:6]).max()
+                    pos = np.abs(A[:, 0:3]).max()
+                    print(f"\n  rotation peak {rot:.4f}  vs  position peak "
+                          f"{pos:.4f}   ratio {rot/(pos+1e-9):.2f}")
+                    if rot < 1e-6:
+                        print("  -> the teleop never sent a rotation command. The "
+                              "wrist pose you remember came from the arm's own IK "
+                              "holding the initial orientation, not from you "
+                              "steering it.")
+                    elif rot < 0.25 * pos:
+                        print("  -> rotation WAS used, just much smaller than "
+                              "position. The plot's fixed axis hid it.")
+
+
+if __name__ == "__main__":
+    main()
