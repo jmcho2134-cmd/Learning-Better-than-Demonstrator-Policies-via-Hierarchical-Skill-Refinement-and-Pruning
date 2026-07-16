@@ -1,0 +1,335 @@
+#!/usr/bin/env python
+"""
+plot_features.py — every feature and every action, each on its own axis, raw.
+================================================================================
+
+One small panel per quantity: the 14 features and the 7 action dimensions, each
+with its own y-axis in its own units, shaded by phase.
+
+This is the complement of replay_video.py, not a duplicate. The video overlays
+curves after min-max normalising them, which is the only way to fit a jerk in the
+hundreds next to a distance in centimetres on one axis -- but it also throws away
+every actual number. Here nothing is normalised, so you can read that
+eef_object_dist really falls 0.95 m, that gripper_open really is two flat levels
+and not a ramp, and that the gripper command really sits pinned at +-1 (which is
+why a small perturbation cannot flip it).
+
+Reads the schema from feature_select.py and the phases from phase_seg.npz if it
+exists. Computes nothing new.
+
+    python plot_features.py --selftest              # synthetic, no robosuite
+    python plot_features.py --demo-root ./demos
+    python plot_features.py --demo-root ./demos --separate   # one PNG each
+"""
+
+import argparse
+import os
+from glob import glob
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import feature_select as fs
+import phase_segment as ps
+
+
+# ===========================================================================
+# SECTION 1 — what to draw, in what order, in what colour
+# ===========================================================================
+KIND_COLOR = {
+    "boundary": "tab:red",       # the only features that may cut the demo
+    "subgoal": "tab:orange",     # may join a subgoal, never a boundary
+    "quality": "tab:gray",       # predicted; never a boundary, never a subgoal
+    "action": "tab:blue",
+}
+
+
+def panel_list(adim):
+    """[(label, role, values_key), ...] in the order the pipeline cares about.
+
+    Ordering by ROLE rather than alphabetically is the point: the three features
+    that make the phases come first, then the ones that may join a subgoal, then
+    the ones that never can, then the raw actions. Reading top to bottom is
+    reading the pipeline's own hierarchy.
+    """
+    out = []
+    for n in fs.NAMES:
+        sp = fs.SPEC[n]
+        role = ("boundary" if sp.boundary else
+                ("quality" if sp.kind == fs.QUALITY else "subgoal"))
+        out.append((n, role, ("F", fs.index_of(n))))
+    anames = (["dx", "dy", "dz", "drx", "dry", "drz", "grip"][:adim]
+              if adim >= 7 else ["dx", "dy", "dz", "grip"][:adim])
+    for j, an in enumerate(anames):
+        out.append((f"action: {an}", "action", ("A", j)))
+    return out
+
+
+def role_note(name, role):
+    if role == "boundary":
+        return f"{fs.SPEC[name].kind} · BOUNDARY"
+    if role == "subgoal":
+        return f"{fs.SPEC[name].kind} · subgoal-eligible"
+    if role == "quality":
+        return "quality · never a subgoal"
+    return "raw action, [-1,1] is the controller's box"
+
+
+# ===========================================================================
+# SECTION 2 — the grid
+# ===========================================================================
+def plot_grid(F, A, seg, dt, out_png, cols=4, title="", log=print):
+    """Every quantity, one panel each, raw units, phase-shaded."""
+    T = len(F)
+    z, bounds, labels = seg["z"], list(seg["bounds"]), seg["labels"]
+    nseg = int(np.max(z)) + 1
+    cmap = plt.get_cmap("tab10")
+    pcolors = [cmap(i % 10) for i in range(nseg)]
+    edges = [0] + bounds + [T]
+    t = np.arange(T) * dt
+    adim = A.shape[1] if A is not None else 0
+    panels = panel_list(adim)
+
+    rows = int(np.ceil(len(panels) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.4 * cols, 2.5 * rows),
+                             squeeze=False)
+    axes = axes.ravel()
+
+    for k, (label, role, (src, j)) in enumerate(panels):
+        ax = axes[k]
+        y = F[:, j] if src == "F" else A[:, j]
+        x = t if src == "F" else np.arange(len(y)) * dt
+        for s in range(nseg):
+            ax.axvspan(edges[s] * dt, edges[s + 1] * dt, color=pcolors[s],
+                       alpha=0.10)
+        for b in bounds:
+            ax.axvline(b * dt, color="0.35", linestyle=":", linewidth=0.9)
+        ax.plot(x, y, color=KIND_COLOR[role], linewidth=1.5)
+        if role == "action":
+            # the controller's box: past it the action clips, and what executed
+            # stops being what was asked for
+            ax.axhline(1.0, color="0.45", linestyle="--", linewidth=0.8)
+            ax.axhline(-1.0, color="0.45", linestyle="--", linewidth=0.8)
+            ax.axhline(0.0, color="0.8", linewidth=0.7)
+            ax.set_ylim(-1.15, 1.15)
+            pinned = float(np.mean(np.abs(y) >= 0.995))
+            note = f"[{y.min():+.2f}, {y.max():+.2f}]"
+            if pinned > 0.2:
+                note += f"   pinned at |1| {100*pinned:.0f}% of the time"
+        else:
+            note = f"[{y.min():.3g}, {y.max():.3g}]  Δ={y.max()-y.min():.3g}"
+        base = label.replace("action: ", "")
+        ax.set_title(f"{label}\n{role_note(base, role)}", fontsize=8.5,
+                     color=KIND_COLOR[role], loc="left")
+        ax.text(0.985, 0.04, note, transform=ax.transAxes, fontsize=7,
+                ha="right", va="bottom", color="0.35")
+        ax.grid(True, alpha=0.25)
+        ax.tick_params(labelsize=7)
+        if k >= len(panels) - cols:
+            ax.set_xlabel("time (s)", fontsize=8)
+    for ax in axes[len(panels):]:
+        ax.axis("off")
+
+    # a phase legend, since the shading is the same in every panel
+    handles = [plt.Line2D([0], [0], color=pcolors[s], linewidth=8, alpha=0.35,
+                          label=f"[{s}] {labels[s] if s < len(labels) else '?'}")
+               for s in range(nseg)]
+    fig.legend(handles=handles, loc="lower center", ncol=min(nseg, 5),
+               fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.004))
+    fig.suptitle(f"{title}   —   every quantity on its own axis, RAW "
+                 f"(nothing normalised)", fontsize=13)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.985])
+    fig.savefig(out_png, dpi=125, bbox_inches="tight")
+    plt.close(fig)
+    log(f"[ok] {out_png}  ({len(panels)} panels)")
+    return out_png
+
+
+def plot_separate(F, A, seg, dt, out_dir, title="", log=print):
+    """One PNG per quantity, for slides or a report."""
+    T = len(F)
+    z, bounds = seg["z"], list(seg["bounds"])
+    nseg = int(np.max(z)) + 1
+    cmap = plt.get_cmap("tab10")
+    pcolors = [cmap(i % 10) for i in range(nseg)]
+    edges = [0] + bounds + [T]
+    t = np.arange(T) * dt
+    adim = A.shape[1] if A is not None else 0
+    os.makedirs(out_dir, exist_ok=True)
+    made = []
+    for label, role, (src, j) in panel_list(adim):
+        y = F[:, j] if src == "F" else A[:, j]
+        x = t if src == "F" else np.arange(len(y)) * dt
+        fig, ax = plt.subplots(figsize=(7, 3))
+        for s in range(nseg):
+            ax.axvspan(edges[s] * dt, edges[s + 1] * dt, color=pcolors[s],
+                       alpha=0.10)
+        for b in bounds:
+            ax.axvline(b * dt, color="0.35", linestyle=":", linewidth=0.9)
+        ax.plot(x, y, color=KIND_COLOR[role], linewidth=1.8)
+        if role == "action":
+            for h in (1.0, -1.0):
+                ax.axhline(h, color="0.45", linestyle="--", linewidth=0.8)
+            ax.set_ylim(-1.15, 1.15)
+        base = label.replace("action: ", "")
+        ax.set_title(f"{label}   ({role_note(base, role)})", fontsize=10)
+        ax.set_xlabel("time (s)"); ax.grid(True, alpha=0.25)
+        fn = os.path.join(out_dir, f"feat_{label.replace('action: ', 'act_')}.png")
+        fig.tight_layout(); fig.savefig(fn, dpi=130, bbox_inches="tight")
+        plt.close(fig); made.append(fn)
+    log(f"[ok] {len(made)} separate PNGs -> {out_dir}/")
+    return made
+
+
+# ===========================================================================
+# SECTION 3 — selftest
+# ===========================================================================
+def run_selftest(out_dir="."):
+    print("=== plot_features SELFTEST (synthetic; no robosuite) ===")
+    ok = True
+    T, dt, adim = 200, 0.05, 7
+    rng = np.random.default_rng(0)
+
+    eef = np.zeros((T, 3)); obj = np.zeros((T, 3))
+    eef[:, 0] = np.linspace(0.0, 0.5, T)
+    eef[:, 2] = 1.0 - 0.14 * np.sin(np.linspace(0, np.pi, T))
+    obj[:80] = [0.25, 0.0, 0.85]
+    obj[80:, 0] = np.linspace(0.25, 0.5, T - 80); obj[80:, 2] = 0.85
+    grip = np.zeros(T); grip[80:170] = 1.0
+    con = np.zeros(T); con[80:170] = 1.0
+    quat = np.tile([0.0, 0.0, 0.0, 1.0], (T, 1))
+    A = rng.normal(0, 0.2, (T - 1, adim))
+    A[:80, 6] = -1.0; A[80:170, 6] = 1.0; A[170:, 6] = -1.0   # a real gripper cmd
+
+    F = fs.compute_trajectory(eef, obj, grip, dt, quat, quat, goal=obj[-1],
+                              actions=A, contact=con)
+    seg = ps.segment_features(F)
+    panels = panel_list(adim)
+    print(f"{len(panels)} panels = {fs.N_FEATURES} features + {adim} actions")
+
+    roles = {}
+    for label, role, _ in panels:
+        roles.setdefault(role, []).append(label)
+    for r in ("boundary", "subgoal", "quality", "action"):
+        print(f"  {r:<9} ({len(roles.get(r, []))}): {roles.get(r, [])}")
+
+    if len(panels) != fs.N_FEATURES + adim:
+        ok = False; print("[FAIL] a quantity is missing or duplicated")
+    if sorted(roles.get("boundary", [])) != sorted(fs.BOUNDARY):
+        ok = False; print(f"[FAIL] boundary panels != {fs.BOUNDARY}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out = plot_grid(F, A, seg, dt, os.path.join(out_dir, "selftest_grid.png"),
+                    title="SELFTEST")
+    sz = os.path.getsize(out)
+    print(f"grid: {sz//1024} KB")
+    if sz < 40000:
+        ok = False; print("[FAIL] the grid looks empty")
+
+    # the whole point of raw axes: the actual numbers must be readable
+    g = F[:, fs.index_of("gripper_open")]
+    d = F[:, fs.index_of("eef_object_dist")]
+    print(f"\nraw ranges the normalised video would have hidden:")
+    print(f"  eef_object_dist  [{d.min():.3f}, {d.max():.3f}]  "
+          f"Δ={d.max()-d.min():.3f} m")
+    print(f"  gripper_open     [{g.min():.3f}, {g.max():.3f}]  "
+          f"-> {len(np.unique(np.round(g, 3)))} distinct levels "
+          f"(a ramp would have hundreds)")
+    pinned = float(np.mean(np.abs(A[:, 6]) >= 0.995))
+    print(f"  action grip      pinned at |1| for {100*pinned:.0f}% of the demo "
+          f"-> no headroom, so a small lambda cannot flip it")
+
+    made = plot_separate(F, A, seg, dt, os.path.join(out_dir, "sep"),
+                         log=lambda *a: None)
+    print(f"\nseparate PNGs: {len(made)}")
+    if len(made) != len(panels):
+        ok = False; print("[FAIL] separate output is missing panels")
+
+    print(f"\n[selftest] {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# ===========================================================================
+# main
+# ===========================================================================
+def main():
+    ap = argparse.ArgumentParser(description="Plot every feature and action on "
+                                             "its own axis, raw.")
+    ap.add_argument("--demo-root", default=os.path.join(".", "demos"))
+    ap.add_argument("--pattern", default="demo.hdf5")
+    ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--max-demos", type=int, default=1)
+    ap.add_argument("--cols", type=int, default=4)
+    ap.add_argument("--separate", action="store_true",
+                    help="also write one PNG per quantity (for slides)")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+
+    if args.selftest:
+        run_selftest(args.out_dir or ".")
+        return
+
+    paths = sorted(glob(os.path.join(args.demo_root, "**", args.pattern),
+                        recursive=True))
+    if not paths:
+        raise SystemExit(f"No '{args.pattern}' under {args.demo_root}")
+    if args.max_demos > 0:
+        paths = paths[:args.max_demos]
+
+    cache = {}
+    try:
+        for hp in paths:
+            env_info, demos = ps.read_demo(hp)
+            robots = env_info["robots"]
+            sig = (env_info["env_name"],
+                   tuple(robots) if isinstance(robots, (list, tuple)) else (robots,))
+            if sig not in cache:
+                print(f"[info] building env {sig[0]} ...")
+                cache[sig] = ps.build_env(env_info)
+            env = cache[sig]
+            dt = 1.0 / float(env_info.get("control_freq", 20))
+            object_type = env_info.get("object_type", None)
+
+            for name, states, actions, model_xml in demos:
+                ps.reset_to_scene(env, model_xml)
+                print(f"[replay] {len(states)} states ...")
+                eef, obj, grip, eq, oq, con = ps.replay(env, states, object_type)
+                goal = ps.infer_goal(obj)
+                F = fs.compute_trajectory(eef, obj, grip, dt, eq, oq, goal,
+                                          obj[0, 2], actions=actions, contact=con)
+
+                seg_p = os.path.join(os.path.dirname(hp), "phase_seg.npz")
+                if os.path.exists(seg_p):
+                    d = np.load(seg_p, allow_pickle=True)
+                    seg = dict(z=d["z"], bounds=list(d["bounds"]),
+                               labels=list(d["labels"]))
+                    print(f"[info] phases from phase_seg.npz: "
+                          f"{int(seg['z'].max())+1}")
+                else:
+                    seg = ps.segment_features(F)
+                    print(f"[info] no phase_seg.npz -- segmenting here: "
+                          f"{int(seg['z'].max())+1} phases")
+
+                out_dir = args.out_dir or os.path.dirname(hp)
+                os.makedirs(out_dir, exist_ok=True)
+                tag = os.path.basename(os.path.dirname(hp)) or name
+                plot_grid(F, np.asarray(actions, float), seg, dt,
+                          os.path.join(out_dir, "features_grid.png"),
+                          cols=args.cols, title=f"{env_info['env_name']} / {tag}")
+                if args.separate:
+                    plot_separate(F, np.asarray(actions, float), seg, dt,
+                                  os.path.join(out_dir, "features_separate"),
+                                  title=tag)
+    finally:
+        for env in cache.values():
+            try:
+                env.close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()
