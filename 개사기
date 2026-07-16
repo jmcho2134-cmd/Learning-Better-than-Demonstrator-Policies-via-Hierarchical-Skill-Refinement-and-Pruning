@@ -109,16 +109,29 @@ def plot_grid(F, A, seg, dt, out_png, cols=4, title="", log=print):
             ax.axvline(b * dt, color="0.35", linestyle=":", linewidth=0.9)
         ax.plot(x, y, color=KIND_COLOR[role], linewidth=1.5)
         if role == "action":
-            # the controller's box: past it the action clips, and what executed
-            # stops being what was asked for
-            ax.axhline(1.0, color="0.45", linestyle="--", linewidth=0.8)
-            ax.axhline(-1.0, color="0.45", linestyle="--", linewidth=0.8)
+            # The controller's box matters -- past it the action clips and what
+            # executed stops being what was asked for -- but pinning every action
+            # panel to [-1.15, 1.15] to show it makes a +-0.05 teleop rotation 4%
+            # of the axis height, i.e. a flat line at zero. That is a plotting
+            # artefact, not a demo that never rotated. So: keep the box when the
+            # dim actually reaches for it, and zoom in when it does not, saying so.
             ax.axhline(0.0, color="0.8", linewidth=0.7)
-            ax.set_ylim(-1.15, 1.15)
+            amax = float(np.abs(y).max())
             pinned = float(np.mean(np.abs(y) >= 0.995))
-            note = f"[{y.min():+.2f}, {y.max():+.2f}]"
-            if pinned > 0.2:
-                note += f"   pinned at |1| {100*pinned:.0f}% of the time"
+            if amax > 0.4:
+                ax.axhline(1.0, color="0.45", linestyle="--", linewidth=0.8)
+                ax.axhline(-1.0, color="0.45", linestyle="--", linewidth=0.8)
+                ax.set_ylim(-1.15, 1.15)
+                note = f"[{y.min():+.2f}, {y.max():+.2f}]"
+                if pinned > 0.2:
+                    note += f"   pinned at |1| {100*pinned:.0f}%"
+            else:
+                lim = max(amax * 1.25, 1e-4)
+                ax.set_ylim(-lim, lim)
+                note = (f"[{y.min():+.3f}, {y.max():+.3f}]   "
+                        f"ZOOMED — uses only {100*amax:.0f}% of the [-1,1] box")
+            if float(np.mean(np.abs(y) > 1e-6)) < 0.01:
+                note = "ALL ZERO — never commanded"
         else:
             note = f"[{y.min():.3g}, {y.max():.3g}]  Δ={y.max()-y.min():.3g}"
         base = label.replace("action: ", "")
